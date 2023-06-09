@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Iterable, Optional, Tuple, Union
 
 import abc
 import argparse
+import string
 import collections
 import dataclasses
 import functools
@@ -230,12 +231,12 @@ class PrefixModel(nn.Module, abc.ABC):
     def prepare_batch(self, batch: Dict[str, str]) -> Tuple[str, str]:
         """Preprocesses text from `batch['input']` and `batch['output']` for inputting into prefix model.
         """
-        if self.prefix_before_input:
-            x_text = [f'. {prompt}' for prompt in batch['input']]
-            y_text = [answer for answer in batch['output']] # strip whitespace at the end.
-        else:
-            x_text = [prompt for prompt in batch['input']]
-            y_text = [answer.rstrip().rstrip('.') for answer in batch['output']] # strip whitespace at the end.
+        # if self.prefix_before_input:
+        #     x_text = [f'. {prompt}' for prompt in batch['input']]
+        #     y_text = [answer for answer in batch['output']] # strip whitespace at the end.
+        # else:
+        x_text = [prompt for prompt in batch['input']]
+        y_text = [answer.rstrip().rstrip('.') for answer in batch['output']] # strip whitespace at the end.
         return x_text, y_text
 
     def forward(
@@ -513,11 +514,18 @@ class PrefixPool:
             print(print_str)
         return pd.DataFrame(output_rows, columns=['idx', 'prefix', 'loss', 'accuracy'])
     
-    def initialize_prefix(self, prefix: torch.Tensor):
-        prefix = tuple(prefix.cpu().tolist())
+    def initialize_prefix(self, prefix: str):
+        # prefix = tuple(prefix.cpu().tolist())
         self._avg_loss[prefix] = 10_000.0
         self._avg_accuracy[prefix] = 0
-        self._best_prefix_by_start_token.setdefault(prefix[0], (prefix, (10_000.0,)))
+
+        def remove_punc(text):
+            exclude = set(string.punctuation)
+            return ''.join(ch for ch in text if ch not in exclude)
+
+        first_token = remove_punc(prefix.strip().split()[0]).lower()
+
+        self._best_prefix_by_start_token.setdefault(first_token, (prefix, (10_000.0,)))
 
     def topk(self, *args, **kwargs) -> List[Tuple[int]]:
         if self._topk_strategy == 'different_start_token':
@@ -590,20 +598,25 @@ class PrefixPool:
         topk_pop.sort(key = lambda t: t[0])
         return [prefix_ids for _, prefix_ids in topk_pop]
 
-    def update(self, prefix: torch.Tensor, loss: torch.Tensor, accuracy: torch.Tensor):
+    def update(self, prefix: str, loss: float, accuracy: float):
         # todo abstract these data strcutures into a class
-        prefix = tuple(prefix.cpu().flatten().tolist())
-        self._all_losses[prefix].append(loss.item())
+        self._all_losses[prefix].append(loss)
         self._avg_loss[prefix] = mean(self._all_losses[prefix])
-        self._all_accuracy[prefix].append(accuracy.item())
+        self._all_accuracy[prefix].append(accuracy)
         self._avg_accuracy[prefix] = mean(self._all_accuracy[prefix])
 
+        def remove_punc(text):
+            exclude = set(string.punctuation)
+            return ''.join(ch for ch in text if ch not in exclude)
+
+        first_token = remove_punc(prefix.strip().split()[0]).lower()
+
         # track best score for each starting token
-        self._best_prefix_by_start_token.setdefault(prefix[0], (prefix, (1000.0,)))
+        self._best_prefix_by_start_token.setdefault(first_token, (prefix, (1000.0,)))
         score = self._score(prefix)
-        best_prefix, best_score = self._best_prefix_by_start_token[prefix[0]]
+        best_prefix, best_score = self._best_prefix_by_start_token[first_token]
         if score < best_score:
-            self._best_prefix_by_start_token[prefix[0]] = (prefix, score)
-    
+            self._best_prefix_by_start_token[first_token] = (prefix, score)
+
     def __len__(self) -> int:
         return len(self._avg_loss)

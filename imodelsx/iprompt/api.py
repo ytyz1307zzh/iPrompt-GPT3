@@ -1,3 +1,5 @@
+import math
+import pdb
 from typing import Callable, Dict, List, Tuple
 
 import datasets
@@ -282,6 +284,7 @@ def run_iprompt_local(
     epoch_save_interval: int = 1,
     mask_possible_answers: bool = False,
     verbose: int = 0,
+    loss_wait_patience: int = 10,
 ):
     """
     Trains a model, either by optimizing continuous embeddings or finding an optimal discrete embedding.
@@ -301,7 +304,7 @@ def run_iprompt_local(
 
     assert len(input_strs) == len(
         output_strs), "input and output must be same length to create input-output pairs"
-    text_strs = list(map(lambda t: f'{t[0]}{t[1]}.', zip(input_strs, output_strs)))
+    text_strs = list(map(lambda t: f'Input: {t[0]}\nOutput: {t[1]}.', zip(input_strs, output_strs)))
     df = pd.DataFrame.from_dict({
         'input': input_strs,
         'output': output_strs,
@@ -371,6 +374,11 @@ def run_iprompt_local(
     stopping_early = False
     total_n_steps = 0
     total_n_datapoints = 0
+
+    best_prefix = None
+    best_prefix_loss = 1000000
+    loss_wait_step = 0
+
     for epoch in range(n_epochs):
         model.pre_epoch()
 
@@ -384,24 +392,70 @@ def run_iprompt_local(
             total_n_steps += 1
             if (n_shots > 1) and (single_shot_loss):
                 batch['input'] = batch['last_input']
-            x_text, y_text = model.prepare_batch(batch=batch)
 
-            tok = functools.partial(
-                model.tokenizer, return_tensors='pt', padding='longest',
-                truncation=True, max_length=max_length)
-            x_tokenized = tok(x_text).to(device)
-            y_tokenized = tok(y_text).to(device)
-            full_text_tokenized = tok(batch['text']).to(device)
+            x_text = [f'Input: {x}\nOutput:' for x in input_strs]
+            y_text = output_strs
+
+            assert len(text_strs) == 3
+            full_text_list = [
+                [text_strs[1], text_strs[2], text_strs[0]],
+                [text_strs[2], text_strs[0], text_strs[1]],
+                [text_strs[0], text_strs[1], text_strs[2]],
+            ]
+            full_text = ['\n\n'.join(x) for x in full_text_list]
 
             loss, n_correct = model.compute_loss_and_call_backward(
-                x_tokenized=x_tokenized,
-                y_tokenized=y_tokenized,
+                x_tokenized=x_text,
+                y_tokenized=y_text,
                 possible_answer_mask=possible_answer_mask,
-                full_text_tokenized=full_text_tokenized,
+                full_text_tokenized=full_text,
             )
 
             r["all_losses"].append(loss)
             r["all_n_correct"].append(n_correct)
+
+            current_best_prefix = model._prefix_pool.topk_all(k=1)[0]
+            current_best_loss = model._prefix_pool._avg_loss[current_best_prefix]
+            assert math.isclose(current_best_loss, min(model._prefix_pool._avg_loss.values()))
+            print(f'Step {idx + 1}, min instruction loss (new): {loss:.6f}')
+            print(f'Step {idx + 1}, min instruction loss (overall): {current_best_loss:.6f}')
+
+            try:
+                # Update the real-time loss of the best prefix
+                best_prefix_loss = model._prefix_pool._avg_loss[best_prefix]
+            except KeyError:
+                pass
+
+            if current_best_loss < best_prefix_loss and current_best_prefix != best_prefix:
+                print(f'New best loss: {best_prefix_loss:.6f} -> {current_best_loss:.6f}!')
+                best_prefix = current_best_prefix
+                best_prefix_loss = current_best_loss
+                loss_wait_step = 0
+                print(f'New best prefix: {best_prefix}')
+            else:
+                if current_best_prefix == best_prefix:
+                    assert math.isclose(current_best_loss, best_prefix_loss)
+
+                loss_wait_step += 1
+                print(f'Current best loss: {best_prefix_loss:.6f}, wait step: {loss_wait_step}')
+                if loss_wait_step >= loss_wait_patience:
+                    print(f'Loss has not improved for {loss_wait_patience} steps, stopping early!')
+                    stopping_early = True
+                    break
+
+            try:
+                assert math.isclose(model._prefix_pool._avg_loss[best_prefix], min(model._prefix_pool._avg_loss.values()))
+            except AssertionError:
+                pdb.set_trace()
+            except KeyError:
+                assert best_prefix_loss > min(model._prefix_pool._avg_loss.values())
+
+            try:
+                assert math.isclose(best_prefix_loss, model._prefix_pool._avg_loss[best_prefix])
+            except AssertionError:
+                pdb.set_trace()
+            except KeyError:
+                assert best_prefix_loss > min(model._prefix_pool._avg_loss.values())
 
             total_n += len(x_text)
             total_n_datapoints += len(x_text)
@@ -416,10 +470,10 @@ def run_iprompt_local(
                 optim.zero_grad()
 
             # Early stopping, check after step
-            model_check_early_stop = model.check_early_stop()
-            if model_check_early_stop:
-                print("model_check_early_stop returned true")
-            if (total_n_datapoints > max_n_datapoints) or (total_n_steps > max_n_steps) or model_check_early_stop:
+            # model_check_early_stop = model.check_early_stop()
+            # if model_check_early_stop:
+            #     print("model_check_early_stop returned true")
+            if (total_n_datapoints > max_n_datapoints) or (total_n_steps > max_n_steps):
                 stopping_early = True
                 break
 
@@ -433,9 +487,9 @@ def run_iprompt_local(
             r[key].append(val)
 
         # r['losses'].append(avg_loss)
-        if epoch % epoch_save_interval == 0:
-            os.makedirs(save_dir, exist_ok=True)
-            pkl.dump(r, open(os.path.join(save_dir, 'results.pkl'), 'wb'))
+        # if epoch % epoch_save_interval == 0:
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     pkl.dump(r, open(os.path.join(save_dir, 'results.pkl'), 'wb'))
 
         model.post_epoch(dataloader=dataloader,
                          possible_answer_mask=possible_answer_mask)
@@ -451,11 +505,8 @@ def run_iprompt_local(
             break
 
     # Serialize model-specific stuff (prefixes & losses for autoprompt, embeddings for prompt tuning, etc.)
-    n_eval = 256
-    eval_dset = datasets.Dataset.from_dict(dset[:n_eval])
-    eval_dataloader = DataLoader(
-        eval_dset, batch_size=batch_size, shuffle=True, drop_last=False)
-    r.update(model.serialize(eval_dataloader, possible_answer_mask))
+    r['prefixes'] = best_prefix
+    r['prefix_train_loss'] = best_prefix_loss
     # r.update(model.serialize())
 
     # save whether prefixes fit the template
@@ -468,7 +519,7 @@ def run_iprompt_local(
     r['train_end_time'] = time.time()
     r['train_time_elapsed'] = r['train_end_time'] - r['train_start_time']
 
-    pkl.dump(r, open(os.path.join(save_dir, 'results.pkl'), 'wb'))
+    # pkl.dump(r, open(os.path.join(save_dir, 'results.pkl'), 'wb'))
 
     return r
 
@@ -603,6 +654,8 @@ def explain_dataset_iprompt(
     verbose: int = 0,  # verbosity level (0 for minimal)
     seed: int = 42,
     llm_api: str = "",
+    openai_model_name: str = "text-davinci-003",
+    loss_wait_patience: int = 10,
 ) -> Tuple[List[str], Dict]:
     """Explain the relationship between the input strings and the output strings
 
@@ -712,6 +765,7 @@ def explain_dataset_iprompt(
             generation_checkpoint=generation_checkpoint,
             llm_candidate_regeneration_prompt_start=llm_candidate_regeneration_prompt_start,
             llm_candidate_regeneration_prompt_end=llm_candidate_regeneration_prompt_end,
+            openai_model_name=openai_model_name,
         )
     else:
         pass
@@ -748,6 +802,7 @@ def explain_dataset_iprompt(
             max_n_steps=max_n_steps,
             epoch_save_interval=epoch_save_interval,
             verbose=verbose,
+            loss_wait_patience=loss_wait_patience,
         )
     else:
         r = run_iprompt_api(

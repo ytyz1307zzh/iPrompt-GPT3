@@ -47,3 +47,6 @@ scratch
 .embgrams
 **workspace
 .history
+
+.gitignore
+test.py
