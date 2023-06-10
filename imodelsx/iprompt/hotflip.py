@@ -73,21 +73,19 @@ class HotFlip(PrefixModel):
         return self._steps_since_new_prefix >= self.args.early_stopping_steps
     
     def _set_prefix_ids(self, new_ids: torch.Tensor) -> None:
-        assert new_ids.ndim == 1, "cannot set prefix with more than 1 dim (need list of IDs)"
-
         # Track steps since new prefix to enable early stopping
-        if (self.prefix_ids is not None) and (self.prefix_ids == new_ids).all():
+        if (self.prefix_ids is not None) and (self.prefix_ids == new_ids):
             self._steps_since_new_prefix += 1
         else:
             self._steps_since_new_prefix = 0
         
 
-        self.prefix_ids = new_ids.to(device)
+        self.prefix_ids = new_ids
         self.prefix_embedding = nn.Parameter(
-            self.token_embedding.to(device).forward(self.prefix_ids), requires_grad=True
+            torch.zeros(len(self.prefix_ids), 1), requires_grad=True
         )
         # track prefixes we've tried
-        self._tested_prefix_ids[(tuple(new_ids.flatten().tolist()), self._swap_token_idx)] += 1
+        self._tested_prefix_ids[(new_ids, self._swap_token_idx)] += 1
 
     def pre_epoch(self) -> None:
         # Print closest tokens at the beginning of each epoch.
